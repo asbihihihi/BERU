@@ -4,6 +4,7 @@ import psutil
 from backend.agent.permissions import PermissionLevel
 from backend.agent.tool_registry import Tool, ToolRegistry
 from .browser import BrowserService
+from .live_info import service as live_info
 
 SCHEMA = lambda props={}, required=[]: {"type":"object", "properties":props, "required":required}
 LOG = logging.getLogger("beru.tools")
@@ -287,6 +288,11 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
     registry.register(Tool("run_terminal","Run a terminal command after approval.",SCHEMA({"command":{"type":"string"}},["command"]),terminal,PermissionLevel.HIGH))
     registry.register(Tool("take_screenshot","Capture desktop screenshot.",SCHEMA(),screenshot,PermissionLevel.MEDIUM))
     registry.register(Tool("web_search","Search current public web pages.",SCHEMA({"query":{"type":"string"}},["query"]),web_search))
+    registry.register(Tool("get_weather", "Get current weather and a two-day forecast. Use for all weather questions.", SCHEMA({"location": {"type": "string", "description": "City or area; omit for the configured default location."}}), live_info.get_weather))
+    registry.register(Tool("get_sports_schedule", "Get current or upcoming soccer schedules. Use for when a team plays or football fixtures.", SCHEMA({"team": {"type": "string"}, "date": {"type": "string", "description": "YYYY-MM-DD, optional for football today."}}), live_info.get_sports_schedule))
+    registry.register(Tool("get_sports_results", "Get actual recent soccer results and scores.", SCHEMA({"team": {"type": "string"}, "date": {"type": "string"}}), live_info.get_sports_results))
+    registry.register(Tool("get_latest_news", "Get current news articles. Use for latest news, including technology or team news.", SCHEMA({"query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 5}}), live_info.get_latest_news))
+    registry.register(Tool("get_current_time", "Get the current date and time in Asia/Jakarta. Use for current time, date, or tomorrow's day.", SCHEMA(), live_info.get_current_time))
     registry.register(Tool("open_url","Open a public web page.",SCHEMA({"url":{"type":"string"}},["url"]),browser.open_url,PermissionLevel.MEDIUM))
     registry.register(Tool("get_page_title","Read the opened page title.",SCHEMA(),browser.get_page_title))
     registry.register(Tool("get_page_text","Extract text from the opened public page.",SCHEMA(),browser.get_page_text))

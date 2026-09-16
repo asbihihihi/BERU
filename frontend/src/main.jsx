@@ -20,9 +20,87 @@ function App() {
     const [pendingMessage, setPendingMessage] = useState('');
     const [online, setOnline] = useState(false);
     const [speaking, setSpeaking] = useState(false);
+    const [voiceMode, setVoiceMode] = useState(false);
+    const [voiceStatus, setVoiceStatus] = useState('Pause');
+    const [status, setStatus] = useState('');
+    const [streamingText, setStreamingText] = useState('');
 
     const socket = useRef(null);
     const currentAudio = useRef(null);
+    const microphone = useRef(null);
+    const audioContext = useRef(null);
+    const microphoneSource = useRef(null);
+    const microphoneProcessor = useRef(null);
+    const pcmCarry = useRef(new Int16Array(0));
+    const voiceReady = useRef(false);
+    const voiceModeRef = useRef(false);
+
+    const stopMicrophone = () => {
+        microphoneProcessor.current?.disconnect();
+        microphoneSource.current?.disconnect();
+        microphoneProcessor.current = null;
+        microphoneSource.current = null;
+        audioContext.current?.close();
+        audioContext.current = null;
+        microphone.current?.getTracks().forEach((track) => track.stop());
+        microphone.current = null;
+        pcmCarry.current = new Int16Array(0);
+    };
+
+    const sendPcm = (samples) => {
+        if (socket.current?.readyState !== WebSocket.OPEN) return;
+        const bytes = new Uint8Array(samples.buffer, samples.byteOffset, samples.byteLength);
+        let binary = '';
+        bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
+        socket.current.send(JSON.stringify({ type: 'voice_audio', audio: btoa(binary) }));
+    };
+
+    const startMicrophone = async () => {
+        if (!voiceModeRef.current || microphone.current) return;
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({
+                audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true }
+            });
+            if (!voiceModeRef.current) {
+                stream.getTracks().forEach((track) => track.stop());
+                return;
+            }
+            const context = new AudioContext();
+            const source = context.createMediaStreamSource(stream);
+            const processor = context.createScriptProcessor(4096, 1, 1);
+            microphone.current = stream;
+            audioContext.current = context;
+            microphoneSource.current = source;
+            microphoneProcessor.current = processor;
+            processor.onaudioprocess = (event) => {
+                const input = event.inputBuffer.getChannelData(0);
+                const ratio = context.sampleRate / 16000;
+                const converted = new Int16Array(Math.floor(input.length / ratio));
+                for (let index = 0; index < converted.length; index += 1) {
+                    const value = input[Math.min(Math.floor(index * ratio), input.length - 1)];
+                    converted[index] = Math.max(-1, Math.min(1, value)) * 32767;
+                }
+                const pending = new Int16Array(pcmCarry.current.length + converted.length);
+                pending.set(pcmCarry.current);
+                pending.set(converted, pcmCarry.current.length);
+                let offset = 0;
+                while (offset + 512 <= pending.length) {
+                    sendPcm(pending.slice(offset, offset + 512));
+                    offset += 512;
+                }
+                pcmCarry.current = pending.slice(offset);
+            };
+            source.connect(processor);
+            processor.connect(context.destination);
+            setVoiceStatus('Mendengarkan...');
+        } catch (error) {
+            const denied = error?.name === 'NotAllowedError' || error?.name === 'SecurityError';
+            setVoiceStatus(denied ? 'BERU belum mendapat izin microphone.' : 'Microphone tidak tersedia.');
+            socket.current?.send(JSON.stringify({ type: 'voice_mode', enabled: false }));
+            voiceModeRef.current = false;
+            setVoiceMode(false);
+        }
+    };
 
     const addEvent = (event) => {
         setEvents((items) => [
@@ -71,6 +149,9 @@ function App() {
                 if (currentAudio.current === audio) {
                     currentAudio.current = null;
                 }
+                if (voiceModeRef.current) {
+                    socket.current?.send(JSON.stringify({ type: 'voice_playback_finished' }));
+                }
             };
 
             audio.onerror = () => {
@@ -80,11 +161,17 @@ function App() {
                 if (currentAudio.current === audio) {
                     currentAudio.current = null;
                 }
+                if (voiceModeRef.current) {
+                    socket.current?.send(JSON.stringify({ type: 'voice_playback_finished' }));
+                }
             };
 
             audio.play().catch((error) => {
                 console.error('Audio playback failed:', error);
                 setSpeaking(false);
+                if (voiceModeRef.current) {
+                    socket.current?.send(JSON.stringify({ type: 'voice_playback_finished' }));
+                }
             });
 
         } catch (error) {
@@ -127,6 +214,19 @@ function App() {
 
             addEvent(data);
 
+            if (data.type === 'thinking') {
+                setStatus(data.status || 'Memproses...');
+                if (voiceModeRef.current) setVoiceStatus('Memproses...');
+            }
+
+            if (data.type === 'tool_started') {
+                setStatus(data.status || 'Menjalankan tool...');
+            }
+
+            if (data.type === 'message_delta') {
+                setStreamingText((current) => current + (data.delta || ''));
+            }
+
             if (data.type === 'message_complete') {
                 setMessages((items) => [
                     ...items,
@@ -135,6 +235,41 @@ function App() {
                         text: data.message
                     }
                 ]);
+                setStreamingText('');
+                setStatus('');
+            }
+
+            if (data.type === 'voice_ready') {
+                voiceReady.current = true;
+                startMicrophone();
+            }
+
+            if (data.type === 'voice_listening') {
+                if (data.status && voiceReady.current) startMicrophone();
+                if (data.status) setVoiceStatus('Mendengarkan...');
+            }
+
+            if (data.type === 'voice_recording' && data.status) {
+                setVoiceStatus('Merekam...');
+            }
+
+            if (data.type === 'voice_recording' && !data.status) {
+                stopMicrophone();
+                setVoiceStatus('Memproses...');
+            }
+
+            if (data.type === 'transcript') {
+                setMessages((items) => [...items, { role: 'user', text: data.text }]);
+                setVoiceStatus('Memproses...');
+            }
+
+            if (data.type === 'voice_speaking' && data.status) {
+                stopMicrophone();
+                setVoiceStatus('BERU berbicara...');
+            }
+
+            if (data.type === 'stt_error' || data.type === 'voice_error') {
+                setVoiceStatus(data.message);
             }
 
             if (data.type === 'permission_required') {
@@ -175,9 +310,33 @@ function App() {
                 currentAudio.current.pause();
             }
 
+            stopMicrophone();
+
             ws.close();
         };
     }, []);
+
+    const toggleVoiceMode = () => {
+        const enabled = !voiceModeRef.current;
+        voiceModeRef.current = enabled;
+        setVoiceMode(enabled);
+        voiceReady.current = false;
+        if (!enabled) {
+            stopMicrophone();
+            setVoiceStatus('Pause');
+            socket.current?.send(JSON.stringify({ type: 'voice_mode', enabled: false }));
+            return;
+        }
+        if (!navigator.mediaDevices?.getUserMedia) {
+            setVoiceStatus('Microphone tidak tersedia.');
+            voiceModeRef.current = false;
+            setVoiceMode(false);
+            return;
+        }
+        setVoiceStatus('Menyiapkan microphone...');
+        socket.current?.send(JSON.stringify({ type: 'voice_mode', enabled: true }));
+        socket.current?.send(JSON.stringify({ type: 'voice_start' }));
+    };
 
     const send = (approved = false) => {
         const message = approved
@@ -238,6 +397,9 @@ function App() {
                         🔊 BERU sedang berbicara
                     </span>
                 )}
+                <button className="voice-toggle" onClick={toggleVoiceMode} disabled={!online}>
+                    {voiceMode ? 'VOICE MODE: ON' : 'VOICE MODE: OFF'}
+                </button>
             </header>
 
             <section className="layout">
@@ -271,6 +433,11 @@ function App() {
                 <article>
                     <h1>BERU AI</h1>
 
+                    {status && <small className="status">{status}</small>}
+                    <div className={`voice-status ${voiceMode ? 'active' : ''}`}>
+                        🎤 {voiceStatus}
+                    </div>
+
                     <div className="chat">
                         {messages.map((message, index) => (
                             <p
@@ -286,6 +453,12 @@ function App() {
                                 {message.text}
                             </p>
                         ))}
+                        {streamingText && (
+                            <p className="assistant streaming">
+                                <label>BERU</label>
+                                {streamingText}
+                            </p>
+                        )}
                     </div>
 
                     {permission && (

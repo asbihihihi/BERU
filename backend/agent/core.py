@@ -1,68 +1,36 @@
 import asyncio
 import json
+import logging
+from time import perf_counter
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from .permissions import PermissionManager
 from .tool_registry import ToolRegistry
-from backend.llm.ollama_client import OllamaClient
+from backend.llm.provider import LLMClient
 
 
 EventSink = Callable[[str, dict[str, Any]], Awaitable[None]]
+LOG = logging.getLogger("beru.agent")
 
 
-SYSTEM = """
-Kamu adalah BERU, asisten AI desktop pribadi milik Asbi.
+SYSTEM = """Kamu adalah BERU, asisten desktop pribadi Asbi.
 
-ATURAN UTAMA:
+ATURAN:
 - SELALU jawab dalam Bahasa Indonesia.
-- Jangan pernah menjawab dalam Bahasa Inggris kecuali Asbi secara eksplisit meminta Bahasa Inggris.
-- Gunakan gaya bicara natural, santai, ramah, dan singkat.
-- Jangan terdengar seperti robot atau customer service formal.
-- Panggil pengguna dengan nama "Asbi" jika sesuai konteks.
-- Untuk sapaan seperti "halo beru", "hai beru", atau "beru", jawab secara singkat dan natural.
-- Jika pengguna hanya menyapa, jangan gunakan tool.
-- Gunakan tools untuk mendapatkan fakta terkini atau melakukan tindakan di komputer.
-- Jangan pernah mengklaim suatu tindakan berhasil jika hasil tool belum mengonfirmasi keberhasilannya.
-- Prioritaskan jawaban yang pendek agar cepat dibacakan oleh suara.
-
-CONTOH:
-User: "halo beru"
-BERU: "Hai Asbi, saya BERU. Mau ngapain hari ini?"
-
-User: "hai beru"
-BERU: "Hai Asbi! Ada yang bisa saya bantu?"
-
-User: "beru"
-BERU: "Iya, Asbi?"
-
-User: "siapa kamu?"
-BERU: "Saya BERU, asisten AI di laptopmu."
-
-User: "buka chrome"
-BERU: "Siap, saya buka Chrome."
-
-Untuk membuka aplikasi, gunakan tool open_application. Parameter target boleh
-berupa nama aplikasi manusia seperti "Chrome", "Discord", "File Explorer",
-atau "Visual Studio Code"; tidak harus berupa nama file .exe.
-
-Jika user meminta mencari file atau folder, gunakan find_file_or_folder. Jika
-user meminta membuka folder, gunakan open_folder; jangan gunakan
-open_application. Jika user meminta menutup, keluar, atau quit aplikasi,
-gunakan close_application. Jangan mengklaim tindakan berhasil sebelum hasil
-tool mengonfirmasinya. Bila found, opened, atau closed bernilai false, jelaskan
-kegagalannya secara jujur, singkat, dan natural. Jangan mengarang alasan,
-menyuruh restart laptop, atau menyuruh menghubungi pemilik komputer tanpa bukti
-masalah sistem.
-
-Sekali lagi: SELALU gunakan Bahasa Indonesia kecuali pengguna meminta bahasa lain.
+- Gunakan tool untuk tindakan laptop dan semua informasi yang realtime/berubah.
+- Cuaca: get_weather. Sepak bola: get_sports_schedule/get_sports_results. Berita: get_latest_news. Waktu/tanggal: get_current_time. Informasi terkini lain: web_search.
+- Jangan gunakan tool untuk sapaan atau obrolan biasa.
+- Jangan mengarang data realtime atau mengklaim tindakan berhasil tanpa hasil tool. Jika tool error, katakan data realtime tidak tersedia.
+- Untuk aplikasi gunakan open_application; folder gunakan open_folder; pencarian file gunakan find_file_or_folder; menutup aplikasi gunakan close_application.
+- Jawaban natural, singkat, dan bukan bahasa Inggris kecuali diminta.
 """
 
 
 class AgentCore:
     def __init__(
         self,
-        llm: OllamaClient,
+        llm: LLMClient,
         tools: ToolRegistry,
         permissions: PermissionManager,
     ):
@@ -75,7 +43,9 @@ class AgentCore:
         user_message: str,
         emit: EventSink,
         approved: bool = False,
+        history: list[dict[str, Any]] | None = None,
     ) -> str:
+        started_at = perf_counter()
         await emit(
             "agent_started",
             {"message": user_message},
@@ -83,14 +53,16 @@ class AgentCore:
 
         await emit(
             "thinking",
-            {"status": "Understanding request"},
+            {"status": "Memproses..."},
         )
 
+        history_length = len(history or [])
         messages = [
             {
                 "role": "system",
                 "content": SYSTEM,
             },
+            *(history or []),
             {
                 "role": "user",
                 "content": user_message,
@@ -98,10 +70,12 @@ class AgentCore:
         ]
 
         try:
+            llm_started = perf_counter()
             reply = await self.llm.chat(
                 messages,
                 self.tools.schemas(),
             )
+            LOG.info("[BERU] Tool selection: %.2fs", perf_counter() - llm_started)
 
             calls = reply.get("tool_calls", [])
 
@@ -120,8 +94,13 @@ class AgentCore:
                     {"message": answer},
                 )
 
+                self._remember_turn(
+                    history,
+                    [*messages[1 + history_length:], reply],
+                )
                 return answer
 
+            tool_messages = []
             for call in calls:
                 fn = call.get("function", {})
 
@@ -164,15 +143,17 @@ class AgentCore:
                         "tool_started",
                         {
                             "tool": name,
-                            "status": "running",
+                    "status": self._tool_status(name),
                         },
                     )
 
                     try:
+                        tool_started = perf_counter()
                         result = await asyncio.wait_for(
                             tool.handler(args),
                             tool.timeout,
                         )
+                        LOG.info("[BERU] Tool %s: %.2fs", name, perf_counter() - tool_started)
                     except Exception as exc:
                         result = {
                             "error": str(exc)
@@ -187,59 +168,76 @@ class AgentCore:
                         },
                     )
 
-                messages.extend(
-                    [
-                        reply,
-                        {
-                            "role": "tool",
-                            "content": json.dumps(
-                                result,
-                                ensure_ascii=False,
-                            ),
-                        },
-                    ]
-                )
+                tool_messages.append({
+                    "role": "tool",
+                    "name": name,
+                    "content": json.dumps(result, ensure_ascii=False),
+                })
+
+            messages.extend([reply, *tool_messages])
 
             await emit(
                 "thinking",
-                {"status": "Preparing response"},
+                {"status": "Menyusun jawaban..."},
             )
 
-            final = await self.llm.chat(messages)
-
-            answer = str(
-                final.get("content") or "Tugas selesai."
-            )
-
-            await emit(
-                "message_delta",
-                {"delta": answer},
-            )
+            # Gemini requires the same tool declarations when a function
+            # response is sent in this stateless follow-up request.
+            final_started = perf_counter()
+            chunks: list[str] = []
+            stream = getattr(self.llm, "chat_stream", None)
+            if stream:
+                async for delta in stream(messages, self.tools.schemas()):
+                    if delta:
+                        chunks.append(str(delta))
+                        await emit("message_delta", {"delta": str(delta)})
+                answer = "".join(chunks) or "Tugas selesai."
+            else:
+                final = await self.llm.chat(messages, self.tools.schemas())
+                answer = str(final.get("content") or "Tugas selesai.")
+                await emit("message_delta", {"delta": answer})
+            LOG.info("[BERU] Final response: %.2fs", perf_counter() - final_started)
 
             await emit(
                 "message_complete",
                 {"message": answer},
             )
 
+            self._remember_turn(
+                history,
+                [*messages[1 + history_length:], {"role": "assistant", "content": answer}],
+            )
             return answer
 
         except Exception as exc:
+            LOG.warning("LLM request failed (%s).", type(exc).__name__)
+            detail = str(exc) if type(exc).__name__ == "GeminiConfigurationError" else "Model tidak tersedia."
             await emit(
                 "error",
                 {
-                    "message": (
-                        "BERU tidak dapat menghubungi "
-                        f"model: {exc}"
-                    )
+                    "message": detail
                 },
             )
 
-            return (
-                "Maaf, model BERU sedang tidak tersedia."
-            )
+            return "Maaf, " + detail
 
         finally:
+            LOG.info("[BERU] Total: %.2fs", perf_counter() - started_at)
             await emit(
                 "agent_finished",
                 {}
             )
+
+    @staticmethod
+    def _remember_turn(history: list[dict[str, Any]] | None, messages: list[dict[str, Any]]) -> None:
+        """Retain a small, session-only context without repeatedly sending all history."""
+        if history is None:
+            return
+        history.extend(messages)
+        # Keep the newest turns and their tool results; cap prompt growth.
+        del history[:-16]
+
+    @staticmethod
+    def _tool_status(name: str) -> str:
+        labels = {"get_weather": "Mencari cuaca...", "get_sports_schedule": "Mencari jadwal pertandingan...", "get_sports_results": "Mencari hasil pertandingan...", "get_latest_news": "Mencari berita terbaru...", "get_current_time": "Memeriksa waktu...", "web_search": "Mencari di web..."}
+        return labels.get(name, f"Menjalankan {name}...")
